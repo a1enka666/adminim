@@ -3,20 +3,29 @@
 # weblogwatch.sh — quick access-log traffic analysis (DDoS / request volume)
 # across servers with different hosting panels, rendered with goaccess.
 #
+# Every log line is tagged with its virtual host (derived from the log file
+# name, since all supported panels keep one file per domain), so goaccess
+# shows the "Virtual Hosts" panel and the script prints a per-domain top list.
+#
 # Usage:
 #   weblogwatch.sh [-p PANEL[,PANEL...]] [-i SINCE] [-t TO] [-f FORMAT]
-#                  [-o REPORT.html] [-r] [-- EXTRA_GOACCESS_ARGS]
+#                  [-o REPORT.html] [-r] [-V] [--top N] [-- EXTRA_GOACCESS_ARGS]
 #
 # Time specs (GNU date):
 #   30m | 2h | 1d | 1w          -> N minutes/hours/days/weeks ago
 #   "1 hour ago" | "today" | "yesterday 20:00" | "2026-10-10 20:00"
+#
+# Options:
+#   -V, --no-vhost   disable per-domain tagging (e.g. one shared access.log)
+#   -r, --rotated    include rotated logs (*.log.N, *.log.N.gz)
+#   --top N          domains in the stderr top list (default 15)
 #
 # Examples:
 #   weblogwatch.sh                        # auto-detect panel, last hour
 #   weblogwatch.sh -p hestia -i 30m       # hestia logs, last 30 minutes
 #   weblogwatch.sh -p da,nginx -i 15m     # merge directadmin + nginx logs
 #   weblogwatch.sh -p aapanel -i 2h -o /root/report.html
-#   weblogwatch.sh -p isp -i 1d -- -a --no-query-string
+#   weblogwatch.sh -p nginx -i 1d -V      # shared access.log, no vhosts
 #
 # Panel aliases: hestia | isp (ispmanager) | da (directadmin) | aapanel |
 #                nginx | apache | auto (default)
@@ -27,15 +36,17 @@ export LC_ALL=C    # match English month names used in log timestamps
 PANEL="auto"
 SINCE="1h"
 TO="now"
-FORMAT="${GOACCESS_LOG_FORMAT:-COMBINED}"
+FORMAT="${GOACCESS_LOG_FORMAT:-}"   # empty = built-in per-mode default
 OUTPUT=""
 ROTATED=0
+VHOST=1
+TOPN=15
 EXTRA=()
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-usage() { sed -n '2,30p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//'; }
+usage() { sed -n '2,37p' "$0" | sed -e 's/^#\{1,\} \{0,1\}//'; }
 
 # --- args -------------------------------------------------------------------
 while (($#)); do
@@ -46,11 +57,19 @@ while (($#)); do
         -f|--format)   FORMAT=$2; shift 2 ;;
         -o|--output)   OUTPUT=$2; shift 2 ;;
         -r|--rotated)  ROTATED=1; shift ;;
+        -V|--no-vhost) VHOST=0; shift ;;
+        --top)         TOPN=$2; shift 2 ;;
         -h|--help)     usage; exit 0 ;;
         --)            shift; EXTRA+=("$@"); break ;;
         *)             die "unknown option: $1 (see --help)" ;;
     esac
 done
+
+[[ $TOPN =~ ^[0-9]+$ ]] || die "--top must be a number"
+if [[ -n $FORMAT && $FORMAT != *%v* && $VHOST -eq 1 ]]; then
+    echo "note: custom format without %v — vhost tagging disabled" >&2
+    VHOST=0
+fi
 
 # --- deps -------------------------------------------------------------------
 if ((${BASH_VERSINFO[0]} < 4 || (${BASH_VERSINFO[0]} == 4 && ${BASH_VERSINFO[1]} < 4))); then
@@ -142,15 +161,30 @@ for f in "${FILES[@]}"; do
 done
 ((${#LOGS[@]})) || die "no access logs matched in: ${ROOTS[*]}"
 
-# --- time window --------------------------------------------------------------
-FROM_LOG=$(log_ts "$SINCE"); TO_LOG=$(log_ts "$TO")
-FROM_H=$(hum_ts "$SINCE");   TO_H=$(hum_ts "$TO")
-FROM_E=$(date -d "$(normalize_spec "$SINCE")" +%s)
-TO_E=$(date -d "$(normalize_spec "$TO")" +%s)
-((FROM_E <= TO_E)) || die "empty time window: $FROM_H .. $TO_H"
+# --- vhost helpers -----------------------------------------------------------
+# Derive a vhost tag from the log file name: /path/example.com.log.1.gz -> example.com
+vhost_of() {
+    local base=${1##*/}
+    base=${base%%.log*}
+    base=${base%_log}
+    base=${base%-log}
+    printf '%s\n' "${base#www.}"
+}
 
-# --- read helpers -------------------------------------------------------------
-# Concatenate logs; rotated .gz files are decompressed on the fly.
+# Emit "vhost <original line>" for every line of every log (gz streams are
+# decompressed on the fly). The tag feeds goaccess' %v (virtual host) field.
+stream_logs() {
+    local f v
+    for f in "$@"; do
+        v=$(vhost_of "$f")
+        case $f in
+            *.gz) gzip -cd -- "$f" 2>/dev/null | awk -v v="$v" '{print v, $0}' || true ;;
+            *)    awk -v v="$v" '{print v, $0}' "$f" 2>/dev/null || true ;;
+        esac
+    done
+}
+
+# Plain concatenation (no vhost tagging).
 cat_all() {
     local f
     for f in "$@"; do
@@ -161,23 +195,52 @@ cat_all() {
     done
 }
 
+# --- time window --------------------------------------------------------------
+FROM_LOG=$(log_ts "$SINCE"); TO_LOG=$(log_ts "$TO")
+FROM_H=$(hum_ts "$SINCE");   TO_H=$(hum_ts "$TO")
+FROM_E=$(date -d "$(normalize_spec "$SINCE")" +%s)
+TO_E=$(date -d "$(normalize_spec "$TO")" +%s)
+((FROM_E <= TO_E)) || die "empty time window: $FROM_H .. $TO_H"
+
 # --- report -------------------------------------------------------------------
 cat >&2 <<EOF
 panel:      $PANEL
 files:      ${#LOGS[@]}
 window:     $FROM_H .. $TO_H   (-i $SINCE -t $TO)
-log format: $FORMAT
+vhosts:     $((VHOST))
+log format: ${FORMAT:-auto}
 output:     ${OUTPUT:-terminal}
 EOF
 
-GOA_ARGS=(--log-format="$FORMAT" "${EXTRA[@]}")
-[[ -n $OUTPUT ]] && GOA_ARGS+=(-o "$OUTPUT")
+[[ -n $OUTPUT ]] && EXTRA+=(-o "$OUTPUT")
 
-# $4 is [dd/Mon/yyyy:HH:MM:SS — lexicographic comparison works because the
-# fields are zero-padded; the timezone in $5 never enters the comparison.
-cat_all "${LOGS[@]}" |
-awk -v from="$FROM_LOG" -v to="$TO_LOG" '
-    $4 >= from && $4 <= to { n++; print }
-    END { printf "lines in window: %d\n", n+0 > "/dev/stderr" }
-' |
-goaccess "${GOA_ARGS[@]}" -
+if ((VHOST)); then
+    # Combined format with the domain prepended as %v (goaccess "Virtual Hosts" panel).
+    # After tagging, fields shift by one: the log date is now $5.
+    GOA_ARGS=(--date-format=%d/%b/%Y --time-format=%H:%M:%S
+              "--log-format=%v %h %^[%d:%t %^] \"%r\" %s %b \"%R\" \"%u\""
+              "${EXTRA[@]}")
+    [[ -n $FORMAT ]] && GOA_ARGS=(--log-format="$FORMAT" "${EXTRA[@]}")
+
+    stream_logs "${LOGS[@]}" |
+    awk -v from="$FROM_LOG" -v to="$TO_LOG" -v topn="$TOPN" '
+        $5 >= from && $5 <= to { cnt[$1]++; n++; print }
+        END {
+            printf "lines in window: %d\n", n+0 > "/dev/stderr"
+            if (n > 0) {
+                print "top vhosts by requests:" > "/dev/stderr"
+                cmd = "sort -rn | head -n " topn
+                for (v in cnt) printf "%10d  %s\n", cnt[v], v | cmd
+                close(cmd)
+            }
+        }' |
+    goaccess "${GOA_ARGS[@]}" -
+else
+    # Classic combined logs without a per-domain tag.
+    GOA_ARGS=(--log-format="${FORMAT:-COMBINED}" "${EXTRA[@]}")
+    cat_all "${LOGS[@]}" |
+    awk -v from="$FROM_LOG" -v to="$TO_LOG" '
+        $4 >= from && $4 <= to { n++; print }
+        END { printf "lines in window: %d\n", n+0 > "/dev/stderr" }' |
+    goaccess "${GOA_ARGS[@]}" -
+fi
