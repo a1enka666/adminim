@@ -75,7 +75,31 @@ fi
 if ((${BASH_VERSINFO[0]} < 4 || (${BASH_VERSINFO[0]} == 4 && ${BASH_VERSINFO[1]} < 4))); then
     die "bash >= 4.4 is required (mapfile -d)"
 fi
-have goaccess || die "goaccess not found in PATH"
+
+# --- goaccess bootstrap -----------------------------------------------------
+SUDO=""
+if [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+fi
+
+if ! command -v goaccess >/dev/null 2>&1; then
+    # goaccess lives in EPEL on RHEL-likes; enable it if absent.
+    if command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y epel-release || true
+        $SUDO dnf install -y goaccess
+    elif command -v yum >/dev/null 2>&1; then
+        $SUDO yum install -y epel-release || true
+        $SUDO yum install -y goaccess
+    elif command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y goaccess
+    else
+        echo "ERROR: goaccess not found and no supported package manager (apt/dnf/yum)" >&2
+        exit 1
+    fi
+fi
+
+command -v goaccess >/dev/null 2>&1 || { echo "ERROR: goaccess installation failed" >&2; exit 1; }
 
 # --- time helpers -----------------------------------------------------------
 # Normalize shorthand intervals ("30m", "2h", "1d", "1w"); pass the rest through.
